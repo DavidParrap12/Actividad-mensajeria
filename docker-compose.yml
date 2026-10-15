@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: sd_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sistemas_distribuidos
+    ports:
+      - "5433:5432"   # 5433 en tu PC para no chocar con un Postgres local en 5432
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sistemas_distribuidos"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: sd_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  relay:
+    build: .
+    container_name: sd_relay
+    command: python -u relay.py
+    environment: &env
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: sistemas_distribuidos
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  consumidor:
+    build: .
+    container_name: sd_consumidor
+    command: python -u consumidor.py
+    environment: *env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Se ejecuta a demanda: docker compose run --rm productor python productor.py 5
+  productor:
+    build: .
+    container_name: sd_productor
+    command: python -u productor.py 3
+    profiles: ["manual"]
+    environment: *env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

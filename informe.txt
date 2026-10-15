@@ -1,0 +1,418 @@
+=====================================================================
+INFORME - PATRÓN OUTBOX CON POSTGRESQL, REDIS Y DOCKER
+Asignatura: Sistemas Distribuidos
+Estudiante: David Parra Pardo
+Fecha: 15 de octubre de 2026
+=====================================================================
+
+
+1. ¿QUÉ ES LA MENSAJERÍA Y PARA QUÉ SIRVE?
+---------------------------------------------------------------------
+La mensajería es una forma de comunicación entre servicios en la que un
+emisor (productor) envía mensajes a un intermediario (broker) y uno o
+varios receptores (consumidores) los leen después. Los servicios no se
+llaman directamente entre sí.
+
+Sirve para:
+- Desacoplar servicios: el productor no necesita saber quién consume.
+- Comunicación asíncrona: el productor no espera la respuesta.
+- Tolerancia a fallos: si el consumidor está caído, los mensajes quedan
+  guardados en el broker y se procesan cuando vuelva.
+- Escalabilidad: se pueden agregar más consumidores para repartir la carga.
+- Absorber picos de tráfico (el broker hace de "colchón").
+
+Brokers comunes: RabbitMQ, Apache Kafka, Redis (Streams / Pub-Sub).
+En este ejercicio se usa REDIS STREAMS.
+
+
+2. BASE DE DATOS POSTGRESQL (tabla ordenes y outbox)
+---------------------------------------------------------------------
+Base de datos: sistemas_distribuidos
+
+Problema que resuelve el patrón Outbox: al crear una orden hay que
+guardarla en la BD y además avisar al broker. Si se hacen por separado,
+uno puede fallar y el otro no (inconsistencia). Solución: guardar la
+orden y el evento en la MISMA transacción de la BD (tabla outbox), y un
+proceso aparte (relay) publica los eventos pendientes al broker.
+
+Script SQL (init.sql):
+
+CREATE TABLE IF NOT EXISTS ordenes (
+    id SERIAL PRIMARY KEY,
+    cliente VARCHAR(100) NOT NULL,
+    producto VARCHAR(100) NOT NULL,
+    cantidad INT NOT NULL,
+    total NUMERIC(10,2) NOT NULL,
+    fecha TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS outbox (
+    id SERIAL PRIMARY KEY,
+    aggregate_id INT NOT NULL,
+    tipo_evento VARCHAR(50) NOT NULL,
+    payload JSONB NOT NULL,
+    procesado BOOLEAN DEFAULT FALSE,
+    creado_en TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_pendientes ON outbox (id) WHERE procesado = FALSE;
+
+
+3. PRODUCTOR, CONSUMIDOR, RELAY Y BROKER
+---------------------------------------------------------------------
+Flujo:
+
+  PRODUCTOR --(1 transacción)--> [ordenes + outbox] en PostgreSQL
+                                        |
+                                      RELAY  (lee outbox con procesado=false)
+                                        |
+                                        v
+                              BROKER: Redis Stream "ordenes_eventos"
+                                        |
+                                        v
+                                   CONSUMIDOR (grupo "grupo_ordenes", XACK)
+
+- PRODUCTOR: inserta la orden y el evento "OrdenCreada" en la misma
+  transacción.
+- RELAY: consulta periódicamente el outbox (FOR UPDATE SKIP LOCKED),
+  publica cada evento con XADD en Redis y lo marca como procesado.
+- BROKER (Redis): guarda los eventos en el stream.
+- CONSUMIDOR: lee con XREADGROUP, procesa, confirma con XACK. Es
+  idempotente (ignora eventos duplicados) porque el relay garantiza
+  entrega "al menos una vez".
+
+Scripts:
+
+----- productor.py -----
+"""PRODUCTOR: crea órdenes y, en la MISMA transacción, el evento en la tabla outbox.
+
+Uso:
+    python productor.py        -> crea 3 órdenes
+    python productor.py 10     -> crea 10 órdenes
+"""
+import json
+import os
+import random
+import sys
+import time
+
+import psycopg2
+
+DB = dict(
+    host=os.getenv("PG_HOST", "localhost"),
+    port=int(os.getenv("PG_PORT", "5433")),
+    dbname=os.getenv("PG_DB", "sistemas_distribuidos"),
+    user=os.getenv("PG_USER", "postgres"),
+    password=os.getenv("PG_PASSWORD", "postgres"),
+)
+
+CLIENTES = ["Juan", "María", "Carlos", "Laura", "Andrés", "Camila"]
+PRODUCTOS = [("Laptop", 2500000), ("Mouse", 45000), ("Teclado", 120000), ("Monitor", 800000)]
+
+
+def conectar():
+    for _ in range(20):
+        try:
+            return psycopg2.connect(**DB)
+        except psycopg2.OperationalError:
+            print("Esperando a Postgres...")
+            time.sleep(2)
+    raise SystemExit("No se pudo conectar a Postgres")
+
+
+def crear_orden(conn):
+    cliente = random.choice(CLIENTES)
+    producto, precio = random.choice(PRODUCTOS)
+    cantidad = random.randint(1, 3)
+    total = precio * cantidad
+
+    # "with conn" = una sola transacción: o se guardan ambas filas o ninguna
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ordenes (cliente, producto, cantidad, total) "
+                "VALUES (%s, %s, %s, %s) RETURNING id",
+                (cliente, producto, cantidad, total),
+            )
+            orden_id = cur.fetchone()[0]
+            payload = {
+                "orden_id": orden_id,
+                "cliente": cliente,
+                "producto": producto,
+                "cantidad": cantidad,
+                "total": total,
+            }
+            cur.execute(
+                "INSERT INTO outbox (aggregate_id, tipo_evento, payload) "
+                "VALUES (%s, %s, %s::jsonb)",
+                (orden_id, "OrdenCreada", json.dumps(payload)),
+            )
+    return payload
+
+
+def main():
+    cantidad = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+    conn = conectar()
+    for _ in range(cantidad):
+        p = crear_orden(conn)
+        print(f"[PRODUCTOR] Orden #{p['orden_id']} creada: {p['cliente']} compró {p['cantidad']} x {p['producto']} (${p['total']})")
+        time.sleep(0.5)
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+----- relay.py -----
+"""RELAY: lee los eventos pendientes de la tabla outbox y los publica en Redis (Stream).
+
+Después de publicar cada evento lo marca como procesado = TRUE.
+Garantía: "al menos una vez" (si el relay se cae entre publicar y confirmar,
+el evento se reenvía; por eso el consumidor debe ser idempotente).
+"""
+import json
+import os
+import time
+
+import psycopg2
+import redis
+
+DB = dict(
+    host=os.getenv("PG_HOST", "localhost"),
+    port=int(os.getenv("PG_PORT", "5433")),
+    dbname=os.getenv("PG_DB", "sistemas_distribuidos"),
+    user=os.getenv("PG_USER", "postgres"),
+    password=os.getenv("PG_PASSWORD", "postgres"),
+)
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+STREAM = "ordenes_eventos"
+INTERVALO = 2  # segundos entre revisiones cuando no hay nada pendiente
+
+
+def conectar_pg():
+    for _ in range(30):
+        try:
+            return psycopg2.connect(**DB)
+        except psycopg2.OperationalError:
+            print("[RELAY] Esperando a Postgres...")
+            time.sleep(2)
+    raise SystemExit("No se pudo conectar a Postgres")
+
+
+def main():
+    conn = conectar_pg()
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    r.ping()
+    print(f"[RELAY] Iniciado. Revisando outbox cada {INTERVALO}s y publicando en el stream '{STREAM}'")
+
+    while True:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, aggregate_id, tipo_evento, payload FROM outbox "
+                    "WHERE procesado = FALSE ORDER BY id LIMIT 50 "
+                    "FOR UPDATE SKIP LOCKED"
+                )
+                filas = cur.fetchall()
+                for outbox_id, aggregate_id, tipo, payload in filas:
+                    r.xadd(
+                        STREAM,
+                        {
+                            "outbox_id": outbox_id,
+                            "aggregate_id": aggregate_id,
+                            "tipo_evento": tipo,
+                            "payload": json.dumps(payload),
+                        },
+                    )
+                    cur.execute("UPDATE outbox SET procesado = TRUE WHERE id = %s", (outbox_id,))
+                    print(f"[RELAY] Evento outbox#{outbox_id} ({tipo}, orden {aggregate_id}) publicado en Redis")
+        if not filas:
+            time.sleep(INTERVALO)
+
+
+if __name__ == "__main__":
+    main()
+
+----- consumidor.py -----
+"""CONSUMIDOR: lee los eventos del stream de Redis y los procesa.
+
+Usa un consumer group (los mensajes se reparten entre consumidores) y XACK
+para confirmar. Es idempotente: si llega un evento repetido, lo ignora.
+"""
+import json
+import os
+import socket
+
+import redis
+from redis.exceptions import ResponseError
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+STREAM = "ordenes_eventos"
+GRUPO = "grupo_ordenes"
+CONSUMIDOR = os.getenv("HOSTNAME", socket.gethostname())
+VISTOS = "outbox_ids_procesados"  # set para evitar procesar duplicados
+
+
+def main():
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    try:
+        r.xgroup_create(STREAM, GRUPO, id="0", mkstream=True)
+    except ResponseError as e:
+        if "BUSYGROUP" not in str(e):
+            raise
+
+    print(f"[CONSUMIDOR] {CONSUMIDOR} escuchando el stream '{STREAM}' (grupo '{GRUPO}')...")
+    while True:
+        respuesta = r.xreadgroup(GRUPO, CONSUMIDOR, {STREAM: ">"}, count=10, block=5000)
+        for _, mensajes in respuesta:
+            for msg_id, campos in mensajes:
+                if r.sadd(VISTOS, campos["outbox_id"]) == 0:
+                    print(f"[CONSUMIDOR] Duplicado outbox#{campos['outbox_id']} ignorado")
+                else:
+                    p = json.loads(campos["payload"])
+                    print(
+                        f"[CONSUMIDOR] {campos['tipo_evento']} -> Orden #{p['orden_id']}: "
+                        f"{p['cliente']} compró {p['cantidad']} x {p['producto']} (${p['total']})"
+                    )
+                r.xack(STREAM, GRUPO, msg_id)
+
+
+if __name__ == "__main__":
+    main()
+
+
+4. TODO EL SET EN DOCKER
+---------------------------------------------------------------------
+Todo corre en contenedores con Docker Compose: postgres, redis, relay,
+consumidor y productor (este último a demanda).
+
+----- Dockerfile -----
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY productor.py relay.py consumidor.py ./
+CMD ["python", "-u", "relay.py"]
+
+----- requirements.txt -----
+psycopg2-binary==2.9.9
+redis==5.0.8
+
+----- docker-compose.yml -----
+services:
+  postgres:
+    image: postgres:16
+    container_name: sd_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sistemas_distribuidos
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sistemas_distribuidos"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: sd_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  relay:
+    build: .
+    container_name: sd_relay
+    command: python -u relay.py
+    environment: &env
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: sistemas_distribuidos
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  consumidor:
+    build: .
+    container_name: sd_consumidor
+    command: python -u consumidor.py
+    environment: *env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  productor:
+    build: .
+    container_name: sd_productor
+    command: python -u productor.py 3
+    profiles: ["manual"]
+    environment: *env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+
+
+5. DEMOSTRACIÓN DEL FUNCIONAMIENTO (paso a paso)
+---------------------------------------------------------------------
+Paso 1. Levantar la infraestructura:
+    docker compose up -d --build
+
+Paso 2. Ver los logs del relay y el consumidor (en dos terminales):
+    docker compose logs -f relay
+    docker compose logs -f consumidor
+
+Paso 3. Producir 5 órdenes:
+    docker compose run --rm productor python productor.py 5
+
+Paso 4. Verificar en PostgreSQL:
+    docker exec -it sd_postgres psql -U postgres -d sistemas_distribuidos
+      SELECT * FROM ordenes;
+      SELECT id, aggregate_id, tipo_evento, procesado FROM outbox;
+
+Paso 5. Verificar en Redis:
+    docker exec -it sd_redis redis-cli XLEN ordenes_eventos
+    docker exec -it sd_redis redis-cli XRANGE ordenes_eventos - +
+
+Paso 6 (resiliencia). Detener el relay, crear órdenes y ver que quedan
+con procesado = false; al volver a iniciar el relay, se publican solas:
+    docker compose stop relay
+    docker compose run --rm productor python productor.py 3
+    docker exec -it sd_postgres psql -U postgres -d sistemas_distribuidos -c "SELECT id, procesado FROM outbox;"
+    docker compose start relay
+
+Salida esperada (resumen):
+    [PRODUCTOR] Orden #1 creada: Juan compró 1 x Laptop ($2500000)
+    [RELAY] Evento outbox#1 (OrdenCreada, orden 1) publicado en Redis
+    [CONSUMIDOR] OrdenCreada -> Orden #1: Juan compró 1 x Laptop ($2500000)
+
+(Pegar aquí capturas o la salida real de la ejecución.)
+
+
+6. CONCLUSIONES
+---------------------------------------------------------------------
+- El patrón Outbox garantiza que no se pierdan eventos aunque el broker
+  esté caído al momento de crear la orden.
+- Redis Streams con consumer groups permite varios consumidores y
+  confirmación de mensajes (XACK).
+- La entrega es "al menos una vez", por eso el consumidor es idempotente.
+- Docker Compose permite reproducir todo el entorno con un solo comando.
